@@ -75,6 +75,10 @@ class KumoCloudConfigFlow(ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             try:
+                # Check if already configured before authenticating
+                await self.async_set_unique_id(user_input[CONF_USERNAME])
+                self._abort_if_unique_id_configured()
+
                 info = await validate_auth(self.hass, user_input)
 
                 self.data.update(user_input)
@@ -94,8 +98,8 @@ class KumoCloudConfigFlow(ConfigFlow, domain=DOMAIN):
                 errors["base"] = "invalid_auth"
             except KumoCloudConnectionError:
                 errors["base"] = "cannot_connect"
-            except Exception:
-                _LOGGER.exception("Unexpected exception")
+            except Exception as err:
+                _LOGGER.exception("Unexpected exception: %s", err)
                 errors["base"] = "unknown"
 
         return self.async_show_form(
@@ -134,10 +138,7 @@ class KumoCloudConfigFlow(ConfigFlow, domain=DOMAIN):
             site for site in self.data["sites"] if site["id"] == self.data[CONF_SITE_ID]
         )
 
-        # Use username as unique ID
-        await self.async_set_unique_id(self.data[CONF_USERNAME])
-        self._abort_if_unique_id_configured()
-
+        # Unique ID already set in async_step_user, no need to check again
         return self.async_create_entry(
             title=f"Kumo Cloud - {selected_site['name']}",
             data={
