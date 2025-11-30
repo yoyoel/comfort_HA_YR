@@ -74,9 +74,23 @@ class KumoCloudAPI:
                     response.raise_for_status()
                     result = await response.json()
 
+                    _LOGGER.debug("Login response: %s", json.dumps(result, indent=2))
+
+                    # Validate response structure
+                    if "token" not in result:
+                        raise KumoCloudConnectionError(
+                            f"Invalid API response: missing 'token' field. Response: {result}"
+                        )
+
+                    token_data = result["token"]
+                    if "access" not in token_data or "refresh" not in token_data:
+                        raise KumoCloudConnectionError(
+                            f"Invalid token structure: {token_data}"
+                        )
+
                     self.username = username
-                    self.access_token = result["token"]["access"]
-                    self.refresh_token = result["token"]["refresh"]
+                    self.access_token = token_data["access"]
+                    self.refresh_token = token_data["refresh"]
                     self.token_expires_at = datetime.now() + timedelta(
                         seconds=TOKEN_REFRESH_INTERVAL
                     )
@@ -84,12 +98,17 @@ class KumoCloudAPI:
                     return result
 
         except asyncio.TimeoutError as err:
+            _LOGGER.error("Login timeout after 10 seconds")
             raise KumoCloudConnectionError("Connection timeout") from err
         except ClientResponseError as err:
+            _LOGGER.error("Login HTTP error: %s", err.status)
             if err.status == 403:
                 raise KumoCloudAuthError("Invalid credentials") from err
             raise KumoCloudConnectionError(f"HTTP error: {err.status}") from err
+        except (KumoCloudAuthError, KumoCloudConnectionError):
+            raise
         except Exception as err:
+            _LOGGER.exception("Unexpected login error: %s", err)
             raise KumoCloudConnectionError(f"Unexpected error: {err}") from err
 
     async def refresh_access_token(self) -> None:
@@ -182,7 +201,15 @@ class KumoCloudAPI:
 
     async def get_sites(self) -> list[dict[str, Any]]:
         """Get list of sites."""
-        return await self._request("GET", "/sites/")
+        try:
+            result = await self._request("GET", "/sites/")
+            if not isinstance(result, list):
+                _LOGGER.error("get_sites returned non-list: %s", type(result))
+                raise KumoCloudConnectionError(f"Invalid sites response: expected list, got {type(result)}")
+            return result
+        except Exception as err:
+            _LOGGER.exception("Error getting sites: %s", err)
+            raise
 
     async def get_zones(self, site_id: str) -> list[dict[str, Any]]:
         """Get list of zones for a site."""
