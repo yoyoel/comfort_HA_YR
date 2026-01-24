@@ -11,7 +11,12 @@ from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 
-from .api import KumoCloudAPI, KumoCloudAuthError, KumoCloudConnectionError
+from .api import (
+    KumoCloudAPI,
+    KumoCloudAuthError,
+    KumoCloudConnectionError,
+    KumoCloudRateLimitError,
+)
 from .const import CONF_SITE_ID, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
@@ -48,9 +53,7 @@ async def validate_auth(
             "sites": sites,
             "api": api,
         }
-    except KumoCloudAuthError:
-        raise
-    except KumoCloudConnectionError:
+    except (KumoCloudAuthError, KumoCloudConnectionError, KumoCloudRateLimitError):
         raise
     except Exception as err:
         _LOGGER.exception("Unexpected error during validation: %s", err)
@@ -96,6 +99,12 @@ class KumoCloudConfigFlow(ConfigFlow, domain=DOMAIN):
 
             except KumoCloudAuthError:
                 errors["base"] = "invalid_auth"
+            except KumoCloudRateLimitError as err:
+                errors["base"] = "cannot_connect"
+                _LOGGER.warning(
+                    "Rate limited during setup. Retry after %s seconds",
+                    err.retry_after or 60,
+                )
             except KumoCloudConnectionError:
                 errors["base"] = "cannot_connect"
             except Exception as err:
@@ -184,6 +193,12 @@ class KumoCloudConfigFlow(ConfigFlow, domain=DOMAIN):
 
             except KumoCloudAuthError:
                 errors["base"] = "invalid_auth"
+            except KumoCloudRateLimitError as err:
+                errors["base"] = "cannot_connect"
+                _LOGGER.warning(
+                    "Rate limited during reauth. Retry after %s seconds",
+                    err.retry_after or 60,
+                )
             except KumoCloudConnectionError:
                 errors["base"] = "cannot_connect"
             except Exception:

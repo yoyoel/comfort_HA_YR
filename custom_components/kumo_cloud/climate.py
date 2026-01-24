@@ -398,8 +398,29 @@ class KumoCloudClimate(CoordinatorEntity, ClimateEntity):
 
     @property
     def available(self) -> bool:
-        """Return True if entity is available."""
+        """Return True if entity is available.
+
+        Keep entities available during rate limit backoff if we have cached data,
+        so users can still see last-known state and send commands.
+        """
+        # If we're rate limited but have cached data, stay available
+        if self.coordinator.is_rate_limited and self.coordinator.data:
+            return self.device.available
+
+        # Normal availability check
         return self.device.available and self.coordinator.last_update_success
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return additional state attributes for diagnostics."""
+        attrs: dict[str, Any] = {"rate_limited": self.coordinator.is_rate_limited}
+
+        if self.coordinator.is_rate_limited:
+            attrs["rate_limit_remaining_seconds"] = (
+                self.coordinator.rate_limit_remaining_seconds
+            )
+
+        return attrs
 
     async def _send_command_and_refresh(self, commands: dict[str, Any]) -> None:
         """Send command and ensure fresh status update."""

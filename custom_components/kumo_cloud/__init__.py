@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -13,8 +13,13 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import KumoCloudAPI, KumoCloudAuthError, KumoCloudConnectionError
-from .const import CONF_SITE_ID, DEFAULT_SCAN_INTERVAL, DOMAIN
+from .api import (
+    KumoCloudAPI,
+    KumoCloudAuthError,
+    KumoCloudConnectionError,
+    KumoCloudRateLimitError,
+)
+from .const import COMMAND_DELAY, CONF_SITE_ID, DEFAULT_SCAN_INTERVAL, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -47,6 +52,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     except KumoCloudAuthError as err:
         raise ConfigEntryAuthFailed(f"Authentication failed: {err}") from err
+    except KumoCloudRateLimitError as err:
+        raise ConfigEntryNotReady(
+            f"Rate limited by API. Retry after {err.retry_after or 60}s"
+        ) from err
     except KumoCloudConnectionError as err:
         raise ConfigEntryNotReady(f"Unable to connect: {err}") from err
 
@@ -90,31 +99,94 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
         self.zones: list[dict[str, Any]] = []
         self.devices: dict[str, dict[str, Any]] = {}
         self.device_profiles: dict[str, list[dict[str, Any]]] = {}
+        # Rate limit state tracking
+        self._rate_limited = False
+        self._rate_limit_until: datetime | None = None
+
+    @property
+    def is_rate_limited(self) -> bool:
+        """Return True if currently in rate limit backoff period."""
+        if not self._rate_limited or not self._rate_limit_until:
+            return False
+        return datetime.now() < self._rate_limit_until
+
+    def _check_and_clear_rate_limit(self) -> bool:
+        """Check if rate limited, clear if expired. Returns True if still limited."""
+        if not self._rate_limited or not self._rate_limit_until:
+            return False
+        if datetime.now() >= self._rate_limit_until:
+            self._clear_rate_limit()
+            return False
+        return True
+
+    @property
+    def rate_limit_remaining_seconds(self) -> int:
+        """Return remaining seconds in rate limit backoff, or 0 if not rate limited."""
+        if not self.is_rate_limited or not self._rate_limit_until:
+            return 0
+        remaining = (self._rate_limit_until - datetime.now()).total_seconds()
+        return max(0, int(remaining))
+
+    def _set_rate_limit(self, retry_after: float) -> None:
+        """Set rate limit backoff state."""
+        self._rate_limited = True
+        self._rate_limit_until = datetime.now() + timedelta(seconds=retry_after)
+        _LOGGER.warning(
+            "Rate limited by Kumo Cloud API. Backing off for %.0f seconds",
+            retry_after,
+        )
+
+    def _clear_rate_limit(self) -> None:
+        """Clear rate limit backoff state."""
+        if self._rate_limited:
+            _LOGGER.info("Rate limit backoff period ended")
+        self._rate_limited = False
+        self._rate_limit_until = None
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from Kumo Cloud."""
+        # Check if we're in rate limit backoff (and clear if expired)
+        if self._check_and_clear_rate_limit():
+            remaining = self.rate_limit_remaining_seconds
+            _LOGGER.debug(
+                "Still in rate limit backoff, %d seconds remaining. Using cached data.",
+                remaining,
+            )
+            # Return cached data if available, otherwise raise UpdateFailed
+            if self.data:
+                return self.data
+            raise UpdateFailed(
+                f"Rate limited, {remaining}s remaining",
+            )
+
         try:
             # Get zones for the site
             zones = await self.api.get_zones(self.site_id)
 
-            # Get device details for each zone
+            # Get device details for each UNIQUE device serial SEQUENTIALLY
+            # Multiple zones may share the same device (multi-zone units)
             devices = {}
             device_profiles = {}
+            seen_serials: set[str] = set()
 
             for zone in zones:
                 if "adapter" in zone and zone["adapter"]:
                     device_serial = zone["adapter"]["deviceSerial"]
 
-                    # Get device details and profile in parallel
-                    device_detail_task = self.api.get_device_details(device_serial)
-                    device_profile_task = self.api.get_device_profile(device_serial)
+                    # Skip if we've already fetched this device
+                    if device_serial in seen_serials:
+                        continue
+                    seen_serials.add(device_serial)
 
-                    device_detail, device_profile = await asyncio.gather(
-                        device_detail_task, device_profile_task
-                    )
+                    # Get device details and profile sequentially (not in parallel)
+                    device_detail = await self.api.get_device_details(device_serial)
+                    device_profile = await self.api.get_device_profile(device_serial)
 
                     devices[device_serial] = device_detail
                     device_profiles[device_serial] = device_profile
+
+            # Success - clear any rate limit state
+            self._clear_rate_limit()
 
             # Store the data for access by entities
             self.zones = zones
@@ -127,16 +199,75 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
                 "device_profiles": device_profiles,
             }
 
+        except KumoCloudRateLimitError as err:
+            retry_after = err.retry_after or 60
+            self._set_rate_limit(retry_after)
+            # Return cached data if available to keep entities available
+            if self.data:
+                _LOGGER.warning(
+                    "Rate limited, using cached data. Will retry in %.0f seconds",
+                    retry_after,
+                )
+            raise UpdateFailed(
+                f"Rate limited by API. Retry after {retry_after}s",
+            ) from err
         except KumoCloudAuthError as err:
-            # Try to refresh token once
+            # Try to refresh token once (don't recurse - just retry the fetch logic)
             try:
                 await self.api.refresh_access_token()
-                # Retry the request
-                return await self._async_update_data()
+            except KumoCloudRateLimitError as rate_err:
+                retry_after = rate_err.retry_after or 60
+                self._set_rate_limit(retry_after)
+                raise UpdateFailed(
+                    f"Rate limited during token refresh. Retry after {retry_after}s",
+                ) from rate_err
             except KumoCloudAuthError as refresh_err:
                 raise UpdateFailed(
                     f"Authentication failed: {refresh_err}"
                 ) from refresh_err
+
+            # Token refreshed successfully - retry fetch (non-recursive)
+            try:
+                zones = await self.api.get_zones(self.site_id)
+                devices = {}
+                device_profiles = {}
+                seen_serials: set[str] = set()
+
+                for zone in zones:
+                    if "adapter" in zone and zone["adapter"]:
+                        device_serial = zone["adapter"]["deviceSerial"]
+                        if device_serial in seen_serials:
+                            continue
+                        seen_serials.add(device_serial)
+                        device_detail = await self.api.get_device_details(device_serial)
+                        device_profile = await self.api.get_device_profile(device_serial)
+                        devices[device_serial] = device_detail
+                        device_profiles[device_serial] = device_profile
+
+                self._clear_rate_limit()
+                self.zones = zones
+                self.devices = devices
+                self.device_profiles = device_profiles
+                return {
+                    "zones": zones,
+                    "devices": devices,
+                    "device_profiles": device_profiles,
+                }
+            except KumoCloudRateLimitError as rate_err:
+                retry_after = rate_err.retry_after or 60
+                self._set_rate_limit(retry_after)
+                raise UpdateFailed(
+                    f"Rate limited after token refresh. Retry after {retry_after}s",
+                ) from rate_err
+            except KumoCloudAuthError as auth_err:
+                raise UpdateFailed(
+                    f"Authentication still failing after refresh: {auth_err}"
+                ) from auth_err
+            except KumoCloudConnectionError as conn_err:
+                raise UpdateFailed(
+                    f"Connection error after token refresh: {conn_err}"
+                ) from conn_err
+
         except KumoCloudConnectionError as err:
             raise UpdateFailed(f"Error communicating with API: {err}") from err
         except Exception as err:
@@ -144,6 +275,15 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
 
     async def async_refresh_device(self, device_serial: str) -> None:
         """Refresh a specific device's data immediately."""
+        # Skip refresh if we're in rate limit backoff
+        if self.is_rate_limited:
+            _LOGGER.debug(
+                "Skipping device refresh for %s - in rate limit backoff (%ds remaining)",
+                device_serial,
+                self.rate_limit_remaining_seconds,
+            )
+            return
+
         try:
             # Get fresh device details
             device_detail = await self.api.get_device_details(device_serial)
@@ -182,6 +322,13 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
 
             _LOGGER.debug("Refreshed device %s data", device_serial)
 
+        except KumoCloudRateLimitError as err:
+            retry_after = err.retry_after or 60
+            self._set_rate_limit(retry_after)
+            _LOGGER.warning(
+                "Rate limited during device refresh for %s. Deferring to next scheduled update.",
+                device_serial,
+            )
         except Exception as err:
             _LOGGER.warning("Failed to refresh device %s: %s", device_serial, err)
 
@@ -199,9 +346,6 @@ class KumoCloudDevice:
         self.coordinator = coordinator
         self.zone_id = zone_id
         self.device_serial = device_serial
-        self._zone_data: dict[str, Any] | None = None
-        self._device_data: dict[str, Any] | None = None
-        self._profile_data: list[dict[str, Any]] | None = None
 
     @property
     def zone_data(self) -> dict[str, Any]:
@@ -254,11 +398,20 @@ class KumoCloudDevice:
             _LOGGER.debug("Sent command to device %s: %s", self.device_serial, commands)
 
             # Wait a moment for the command to be processed
-            await asyncio.sleep(1)
+            await asyncio.sleep(COMMAND_DELAY)
 
             # Refresh this specific device's data immediately
+            # This may be skipped if rate limited, but the command was already sent
             await self.coordinator.async_refresh_device(self.device_serial)
 
+        except KumoCloudRateLimitError as err:
+            # Command was rate limited - set backoff and raise
+            retry_after = err.retry_after or 60
+            self.coordinator._set_rate_limit(retry_after)
+            _LOGGER.error(
+                "Command to device %s rate limited: %s", self.device_serial, err
+            )
+            raise
         except Exception as err:
             _LOGGER.error(
                 "Failed to send command to device %s: %s", self.device_serial, err

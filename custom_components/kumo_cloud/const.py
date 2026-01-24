@@ -42,3 +42,12 @@ AIR_DIRECTION_SWING = "swing"
 
 # Default scan interval in seconds
 DEFAULT_SCAN_INTERVAL = 60
+
+# Rate limiting constants
+MAX_CONCURRENT_REQUESTS = 2      # Limit parallel requests
+RETRY_ATTEMPTS = 3               # Retry transient failures
+RETRY_BACKOFF_BASE = 1.0         # Initial retry delay (seconds)
+RETRY_BACKOFF_MAX = 16.0         # Max retry delay
+RATE_LIMIT_BACKOFF_BASE = 60     # Base backoff after 429 (seconds)
+RATE_LIMIT_BACKOFF_MAX = 300     # Max backoff (5 min)
+COMMAND_DELAY = 1.0              # Delay after command before refreshing (seconds)
