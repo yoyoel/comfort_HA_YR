@@ -372,8 +372,8 @@ class KumoCloudAPI:
             except KumoCloudAuthError:
                 # Don't retry auth errors - propagate immediately
                 raise
-            except asyncio.TimeoutError as err:
-                last_error = KumoCloudConnectionError("Request timeout") from err
+            except asyncio.TimeoutError:
+                last_error = KumoCloudConnectionError("Request timeout")
                 _LOGGER.debug(
                     "Request timeout (attempt %d/%d): %s",
                     attempt + 1, RETRY_ATTEMPTS, endpoint
