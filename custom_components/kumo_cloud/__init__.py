@@ -32,9 +32,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Create API client
     api = KumoCloudAPI(hass)
 
+    # Store credentials for potential re-login
+    api.set_credentials(entry.data[CONF_USERNAME], entry.data[CONF_PASSWORD])
+
+    # Set up callback to persist tokens when they're refreshed
+    async def on_token_update(access_token: str, refresh_token: str) -> None:
+        """Persist updated tokens to config entry."""
+        _LOGGER.debug("Persisting updated tokens to config entry")
+        hass.config_entries.async_update_entry(
+            entry,
+            data={
+                **entry.data,
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+            },
+        )
+
+    api.set_token_update_callback(on_token_update)
+
     # Initialize with stored tokens if available
     if "access_token" in entry.data:
-        api.username = entry.data[CONF_USERNAME]
         api.access_token = entry.data["access_token"]
         api.refresh_token = entry.data["refresh_token"]
 
@@ -47,7 +64,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             try:
                 await api.get_account_info()
             except KumoCloudAuthError:
-                # Token expired, try to login again
+                # Token expired, try to login again (this will use stored credentials)
+                _LOGGER.info("Stored tokens invalid, attempting fresh login")
                 await api.login(entry.data[CONF_USERNAME], entry.data[CONF_PASSWORD])
 
     except KumoCloudAuthError as err:
@@ -60,7 +78,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         raise ConfigEntryNotReady(f"Unable to connect: {err}") from err
 
     # Create the coordinator
-    coordinator = KumoCloudDataUpdateCoordinator(hass, api, entry.data[CONF_SITE_ID])
+    coordinator = KumoCloudDataUpdateCoordinator(hass, api, entry.data[CONF_SITE_ID], entry)
 
     # Fetch initial data so we have data when entities are added
     await coordinator.async_config_entry_first_refresh()
@@ -86,7 +104,13 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
     """Class to manage fetching Kumo Cloud data."""
 
-    def __init__(self, hass: HomeAssistant, api: KumoCloudAPI, site_id: str) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        api: KumoCloudAPI,
+        site_id: str,
+        config_entry: ConfigEntry,
+    ) -> None:
         """Initialize the coordinator."""
         super().__init__(
             hass,
@@ -96,12 +120,16 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
         )
         self.api = api
         self.site_id = site_id
+        self.config_entry = config_entry
         self.zones: list[dict[str, Any]] = []
         self.devices: dict[str, dict[str, Any]] = {}
         self.device_profiles: dict[str, list[dict[str, Any]]] = {}
         # Rate limit state tracking
         self._rate_limited = False
         self._rate_limit_until: datetime | None = None
+        # Auth failure tracking
+        self._auth_failures = 0
+        self._max_auth_failures = 3  # Trigger reauth after this many consecutive failures
 
     @property
     def is_rate_limited(self) -> bool:
@@ -185,8 +213,9 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
                     devices[device_serial] = device_detail
                     device_profiles[device_serial] = device_profile
 
-            # Success - clear any rate limit state
+            # Success - clear any rate limit state and auth failures
             self._clear_rate_limit()
+            self._auth_failures = 0
 
             # Store the data for access by entities
             self.zones = zones
@@ -211,62 +240,30 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
             raise UpdateFailed(
                 f"Rate limited by API. Retry after {retry_after}s",
             ) from err
+
         except KumoCloudAuthError as err:
-            # Try to refresh token once (don't recurse - just retry the fetch logic)
-            try:
-                await self.api.refresh_access_token()
-            except KumoCloudRateLimitError as rate_err:
-                retry_after = rate_err.retry_after or 60
-                self._set_rate_limit(retry_after)
-                raise UpdateFailed(
-                    f"Rate limited during token refresh. Retry after {retry_after}s",
-                ) from rate_err
-            except KumoCloudAuthError as refresh_err:
-                raise UpdateFailed(
-                    f"Authentication failed: {refresh_err}"
-                ) from refresh_err
+            # Track consecutive auth failures
+            self._auth_failures += 1
+            _LOGGER.warning(
+                "Authentication error (failure %d/%d): %s",
+                self._auth_failures,
+                self._max_auth_failures,
+                err,
+            )
 
-            # Token refreshed successfully - retry fetch (non-recursive)
-            try:
-                zones = await self.api.get_zones(self.site_id)
-                devices = {}
-                device_profiles = {}
-                seen_serials: set[str] = set()
+            # If we've had too many consecutive auth failures, trigger reauth
+            if self._auth_failures >= self._max_auth_failures:
+                _LOGGER.error(
+                    "Too many consecutive auth failures, triggering re-authentication"
+                )
+                self.config_entry.async_start_reauth(self.hass)
+                raise UpdateFailed(
+                    "Authentication failed repeatedly. Please re-authenticate."
+                ) from err
 
-                for zone in zones:
-                    if "adapter" in zone and zone["adapter"]:
-                        device_serial = zone["adapter"]["deviceSerial"]
-                        if device_serial in seen_serials:
-                            continue
-                        seen_serials.add(device_serial)
-                        device_detail = await self.api.get_device_details(device_serial)
-                        device_profile = await self.api.get_device_profile(device_serial)
-                        devices[device_serial] = device_detail
-                        device_profiles[device_serial] = device_profile
-
-                self._clear_rate_limit()
-                self.zones = zones
-                self.devices = devices
-                self.device_profiles = device_profiles
-                return {
-                    "zones": zones,
-                    "devices": devices,
-                    "device_profiles": device_profiles,
-                }
-            except KumoCloudRateLimitError as rate_err:
-                retry_after = rate_err.retry_after or 60
-                self._set_rate_limit(retry_after)
-                raise UpdateFailed(
-                    f"Rate limited after token refresh. Retry after {retry_after}s",
-                ) from rate_err
-            except KumoCloudAuthError as auth_err:
-                raise UpdateFailed(
-                    f"Authentication still failing after refresh: {auth_err}"
-                ) from auth_err
-            except KumoCloudConnectionError as conn_err:
-                raise UpdateFailed(
-                    f"Connection error after token refresh: {conn_err}"
-                ) from conn_err
+            # The API will attempt re-login automatically on next request
+            # Just raise UpdateFailed for now and let the next update try again
+            raise UpdateFailed(f"Authentication failed: {err}") from err
 
         except KumoCloudConnectionError as err:
             raise UpdateFailed(f"Error communicating with API: {err}") from err
@@ -397,6 +394,9 @@ class KumoCloudDevice:
             await self.coordinator.api.send_command(self.device_serial, commands)
             _LOGGER.debug("Sent command to device %s: %s", self.device_serial, commands)
 
+            # Reset auth failures on successful command
+            self.coordinator._auth_failures = 0
+
             # Wait a moment for the command to be processed
             await asyncio.sleep(COMMAND_DELAY)
 
@@ -411,6 +411,21 @@ class KumoCloudDevice:
             _LOGGER.error(
                 "Command to device %s rate limited: %s", self.device_serial, err
             )
+            raise
+        except KumoCloudAuthError as err:
+            # Auth failed even after API's automatic re-login attempt
+            self.coordinator._auth_failures += 1
+            _LOGGER.error(
+                "Command to device %s auth failed (failure %d/%d): %s",
+                self.device_serial,
+                self.coordinator._auth_failures,
+                self.coordinator._max_auth_failures,
+                err,
+            )
+            # Trigger reauth if too many failures
+            if self.coordinator._auth_failures >= self.coordinator._max_auth_failures:
+                _LOGGER.error("Too many auth failures, triggering re-authentication")
+                self.coordinator.config_entry.async_start_reauth(self.coordinator.hass)
             raise
         except Exception as err:
             _LOGGER.error(
