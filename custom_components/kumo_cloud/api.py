@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Callable, Coroutine
 
 import random
 
@@ -64,6 +64,7 @@ class KumoCloudAPI:
         self.session = async_get_clientsession(hass)
         self.base_url = API_BASE_URL
         self.username: str | None = None
+        self._password: str | None = None  # Stored for re-login
         self.access_token: str | None = None
         self.refresh_token: str | None = None
         self.token_expires_at: datetime | None = None
@@ -72,6 +73,27 @@ class KumoCloudAPI:
         self._consecutive_rate_limits = 0
         # Token refresh lock to prevent concurrent refreshes
         self._token_refresh_lock = asyncio.Lock()
+        # Callback for token updates (to persist to config entry)
+        self._on_token_update: Callable[[str, str], Coroutine[Any, Any, None]] | None = None
+
+    def set_credentials(self, username: str, password: str) -> None:
+        """Store credentials for potential re-login."""
+        self.username = username
+        self._password = password
+
+    def set_token_update_callback(
+        self, callback: Callable[[str, str], Coroutine[Any, Any, None]]
+    ) -> None:
+        """Set callback to be called when tokens are updated."""
+        self._on_token_update = callback
+
+    async def _notify_token_update(self) -> None:
+        """Notify callback that tokens have been updated."""
+        if self._on_token_update:
+            try:
+                await self._on_token_update(self.access_token, self.refresh_token)
+            except Exception as err:
+                _LOGGER.warning("Failed to persist token update: %s", err)
 
     async def login(self, username: str, password: str) -> dict[str, Any]:
         """Login to Kumo Cloud and return user data."""
@@ -133,12 +155,16 @@ class KumoCloudAPI:
                             )
 
                         self.username = username
+                        self._password = password  # Store for re-login
                         self.access_token = token_data["access"]
                         self.refresh_token = token_data["refresh"]
                         self.token_expires_at = datetime.now() + timedelta(
                             seconds=TOKEN_REFRESH_INTERVAL
                         )
                         self._consecutive_rate_limits = 0
+
+                        # Notify callback of new tokens
+                        await self._notify_token_update()
 
                         return result
 
@@ -157,8 +183,16 @@ class KumoCloudAPI:
             raise KumoCloudConnectionError(f"Unexpected error: {err}") from err
 
     async def refresh_access_token(self) -> None:
-        """Refresh the access token with retry logic."""
+        """Refresh the access token with retry logic.
+
+        If refresh fails with 401 (token expired), attempts re-login with stored credentials.
+        """
         if not self.refresh_token:
+            # No refresh token - try re-login if we have credentials
+            if self.username and self._password:
+                _LOGGER.info("No refresh token, attempting re-login")
+                await self.login(self.username, self._password)
+                return
             raise KumoCloudAuthError("No refresh token available")
 
         url = f"{self.base_url}/{API_VERSION}/refresh"
@@ -199,6 +233,13 @@ class KumoCloudAPI:
                                 )
 
                             if response.status == 401:
+                                # Refresh token expired - try re-login
+                                if self.username and self._password:
+                                    _LOGGER.info(
+                                        "Refresh token expired, attempting re-login"
+                                    )
+                                    await self.login(self.username, self._password)
+                                    return
                                 raise KumoCloudAuthError("Refresh token expired")
 
                             response.raise_for_status()
@@ -210,6 +251,9 @@ class KumoCloudAPI:
                                 seconds=TOKEN_REFRESH_INTERVAL
                             )
                             self._consecutive_rate_limits = 0
+
+                            # Notify callback of updated tokens
+                            await self._notify_token_update()
                             return
 
             except KumoCloudRateLimitError:
@@ -218,7 +262,7 @@ class KumoCloudAPI:
             except KumoCloudAuthError:
                 # Don't retry auth errors
                 raise
-            except asyncio.TimeoutError as err:
+            except asyncio.TimeoutError:
                 last_error = KumoCloudConnectionError("Connection timeout during refresh")
                 _LOGGER.debug(
                     "Token refresh timeout (attempt %d/%d)",
@@ -226,6 +270,11 @@ class KumoCloudAPI:
                 )
             except ClientResponseError as err:
                 if err.status == 401:
+                    # Refresh token expired - try re-login
+                    if self.username and self._password:
+                        _LOGGER.info("Refresh token expired, attempting re-login")
+                        await self.login(self.username, self._password)
+                        return
                     raise KumoCloudAuthError("Refresh token expired") from err
                 last_error = KumoCloudConnectionError(
                     f"HTTP error during refresh: {err.status}"
